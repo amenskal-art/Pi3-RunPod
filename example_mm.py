@@ -3,7 +3,7 @@ import argparse
 import numpy as np
 import os
 from pi3.utils.basic import load_multimodal_data, write_ply
-from pi3.utils.geometry import depth_edge
+from pi3.utils.geometry import depth_edge, recover_intrinsic_from_rays_d
 from pi3.models.pi3x import Pi3X
 
 if __name__ == '__main__':
@@ -113,6 +113,13 @@ if __name__ == '__main__':
                 imgs=imgs, 
                 **conditions
             )
+
+    # 3.5 Recover intrinsic from rays_d
+    rays_d = torch.nn.functional.normalize(res['local_points'], dim=-1)
+    K = recover_intrinsic_from_rays_d(rays_d, force_center_principal_point=True)
+    print(f"Recovered frist frame intrinsic: \n{K[0, 0].cpu().numpy()}")
+    if conditions['intrinsics'] is not None:
+        print(f"Original frist frame intrinsic: \n{conditions['intrinsics'][0, 0].cpu().numpy()}")
 
     # 4. process mask
     masks = torch.sigmoid(res['conf'][..., 0]) > 0.1

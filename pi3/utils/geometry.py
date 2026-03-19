@@ -365,3 +365,69 @@ def depth_edge(depth: torch.Tensor, atol: float = None, rtol: float = None, kern
         edge |= (diff / depth).nan_to_num_() > rtol
     edge = edge.reshape(*shape)
     return edge
+
+def recover_intrinsic_from_rays_d(
+    rays_d: torch.Tensor, 
+    ndc_coords: bool = False,
+    force_center_principal_point: bool = False
+):
+    device = rays_d.device
+    dtype = rays_d.dtype
+    
+    *batch_dims, H, W, _ = rays_d.shape
+    num_points = H * W
+
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(0, H - 1, H, device=device, dtype=dtype),
+        torch.linspace(0, W - 1, W, device=device, dtype=dtype),
+        indexing="ij" 
+    )
+
+    if ndc_coords:
+        grid_x = grid_x * (2.0 / (W - 1)) - 1.0
+        grid_y = grid_y * (2.0 / (H - 1)) - 1.0
+
+    u_targets = grid_x.reshape(1, num_points).expand(*batch_dims, num_points) # (..., N)
+    v_targets = grid_y.reshape(1, num_points).expand(*batch_dims, num_points) # (..., N)
+
+    z_abs = rays_d[..., 2].abs() + 1e-10 
+    x_projs = (rays_d[..., 0] / z_abs).reshape(*batch_dims, num_points) # (..., N)
+    y_projs = (rays_d[..., 1] / z_abs).reshape(*batch_dims, num_points) # (..., N)
+
+    if force_center_principal_point:
+        if ndc_coords:
+            cx_val, cy_val = 0.0, 0.0
+        else:
+            cx_val, cy_val = (W - 1) / 2.0, (H - 1) / 2.0
+            
+        u_centered = u_targets - cx_val
+        v_centered = v_targets - cy_val
+        
+        fx = (x_projs * u_centered).sum(dim=-1) / (x_projs * x_projs).sum(dim=-1)
+        fy = (y_projs * v_centered).sum(dim=-1) / (y_projs * y_projs).sum(dim=-1)
+        
+        cx = torch.full_like(fx, cx_val)
+        cy = torch.full_like(fy, cy_val)
+        
+    else:
+        def solve_linear_least_squares(X, Y):
+            mean_X = X.mean(dim=-1, keepdim=True)
+            mean_Y = Y.mean(dim=-1, keepdim=True)
+            X_centered = X - mean_X
+            Y_centered = Y - mean_Y
+            
+            a = (X_centered * Y_centered).sum(dim=-1) / (X_centered * X_centered).sum(dim=-1)
+            b = mean_Y.squeeze(-1) - a * mean_X.squeeze(-1)
+            return a, b
+
+        fx, cx = solve_linear_least_squares(x_projs, u_targets)
+        fy, cy = solve_linear_least_squares(y_projs, v_targets)
+
+    K = torch.zeros((*batch_dims, 3, 3), device=device, dtype=dtype)
+    K[..., 0, 0] = fx
+    K[..., 0, 2] = cx
+    K[..., 1, 1] = fy
+    K[..., 1, 2] = cy
+    K[..., 2, 2] = 1.0
+
+    return K
