@@ -2,9 +2,47 @@ import torch
 import argparse
 import numpy as np
 import os
+import open3d as o3d  # Added Open3D for geometric processing
 from pi3.utils.basic import load_multimodal_data, write_ply
 from pi3.utils.geometry import depth_edge, recover_intrinsic_from_rays_d
 from pi3.models.pi3x import Pi3X
+
+def apply_planar_projection(points_np, colors_np=None, radius=0.04, iterations=3):
+    """
+    Applies Moving Least Squares (MLS) Planar Projection to a point cloud array.
+    """
+    pcd = o3d.geometry.PointCloud()
+    
+    # Open3D works best with float64
+    pcd.points = o3d.utility.Vector3dVector(points_np.astype(np.float64))
+    if colors_np is not None:
+        pcd.colors = o3d.utility.Vector3dVector(colors_np.astype(np.float64))
+
+    num_points = len(points_np)
+    
+    for it in range(iterations):
+        print(f"  -> Smoothing iteration {it + 1}/{iterations}...")
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamRadius(radius=radius))
+        
+        normals = np.asarray(pcd.normals)
+        points = np.asarray(pcd.points)
+        new_points = np.copy(points)
+        pcd_tree = o3d.geometry.KDTreeFlann(pcd)
+        
+        for i in range(num_points):
+            [k, idx, _] = pcd_tree.search_radius_vector_3d(pcd.points[i], radius)
+            if k > 3:
+                neighbors = points[idx, :]
+                centroid = np.mean(neighbors, axis=0)
+                normal = normals[i]
+                
+                vector_to_point = points[i] - centroid
+                distance_to_plane = np.dot(vector_to_point, normal)
+                new_points[i] = points[i] - (distance_to_plane * normal)
+                
+        pcd.points = o3d.utility.Vector3dVector(new_points)
+    
+    return np.asarray(pcd.points), np.asarray(pcd.colors) if colors_np is not None else None
 
 if __name__ == '__main__':
     # --- Argument Parsing ---
@@ -77,32 +115,6 @@ if __name__ == '__main__':
             model.disable_multimodal()
     model = model.to(device)
 
-    """
-    Args:
-        imgs (torch.Tensor): Input RGB images valued in [0, 1].
-            Shape: (B, N, 3, H, W).
-        intrinsics (torch.Tensor, optional): Camera intrinsic matrices.
-            Shape: (B, N, 3, 3).
-            Values are in pixel coordinates (not normalized).
-        rays (torch.Tensor, optional): Pre-computed ray directions (unit vectors).
-            Shape: (B, N, H, W, 3).
-            Can replace `intrinsics` as a geometric condition.
-        poses (torch.Tensor, optional): Camera-to-World matrices.
-            Shape: (B, N, 4, 4).
-            Coordinate system: OpenCV convention (Right-Down-Forward).
-        depths (torch.Tensor, optional): Ground truth or prior depth maps.
-            Shape: (B, N, H, W).
-            Invalid values (e.g., sky or missing data) should be set to 0.
-        mask_add_depth (torch.Tensor, optional): Mask for depth condition.
-            Shape: (B, N, N).
-        mask_add_ray (torch.Tensor, optional): Mask for ray/intrinsic condition.
-            Shape: (B, N, N).
-        mask_add_pose (torch.Tensor, optional): Mask for pose condition.
-            Shape: (B, N, N).
-            Note: Requires at least two frames to be True to establish a meaningful
-            coordinate system (absolute pose for a single frame provides no relative constraint).
-    """
-
     # 3. Infer
     print("Running model inference...")
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -117,19 +129,39 @@ if __name__ == '__main__':
     # 3.5 Recover intrinsic from rays_d
     rays_d = torch.nn.functional.normalize(res['local_points'], dim=-1)
     K = recover_intrinsic_from_rays_d(rays_d, force_center_principal_point=True)
-    print(f"Recovered frist frame intrinsic: \n{K[0, 0].cpu().numpy()}")
+    print(f"Recovered first frame intrinsic: \n{K[0, 0].cpu().numpy()}")
     if conditions['intrinsics'] is not None:
-        print(f"Original frist frame intrinsic: \n{conditions['intrinsics'][0, 0].cpu().numpy()}")
+        print(f"Original first frame intrinsic: \n{conditions['intrinsics'][0, 0].cpu().numpy()}")
 
     # 4. process mask
     masks = torch.sigmoid(res['conf'][..., 0]) > 0.1
     non_edge = ~depth_edge(res['local_points'][..., 2], rtol=0.03)
     masks = torch.logical_and(masks, non_edge)[0]
 
-    # 5. Save points
+    # 5. Extract, Smooth, and Save points
+    print("Extracting points for geometry refinement...")
+    
+    # Extract raw masked points and colors to CPU numpy arrays
+    raw_points_np = res['points'][0][masks].cpu().numpy()
+    raw_colors_np = imgs[0].permute(0, 2, 3, 1)[masks].cpu().numpy()
+
+    # Apply the Planar Projection logic
+    print("Applying Planar Projection to collapse multi-view thickness...")
+    smoothed_points_np, smoothed_colors_np = apply_planar_projection(
+        points_np=raw_points_np, 
+        colors_np=raw_colors_np, 
+        radius=0.04, 
+        iterations=3
+    )
+
+    # Convert back to PyTorch tensors so the native write_ply function works normally
+    final_points_tensor = torch.from_numpy(smoothed_points_np).float()
+    final_colors_tensor = torch.from_numpy(smoothed_colors_np).float()
+
     print(f"Saving point cloud to: {args.save_path}")
     if os.path.dirname(args.save_path):
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
         
-    write_ply(res['points'][0][masks].cpu(), imgs[0].permute(0, 2, 3, 1)[masks], args.save_path)
+    # Use the pipeline's native writer with the newly smoothed tensors
+    write_ply(final_points_tensor, final_colors_tensor, args.save_path)
     print("Done.")
