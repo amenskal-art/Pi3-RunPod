@@ -1,167 +1,178 @@
-import torch
+# ==========================================
+# 1. ENVIRONMENT SETUP & ARGUMENT PARSING
+# ==========================================
 import argparse
+import torch
 import numpy as np
 import os
-import open3d as o3d  # Added Open3D for geometric processing
-from pi3.utils.basic import load_multimodal_data, write_ply
-from pi3.utils.geometry import depth_edge, recover_intrinsic_from_rays_d
+import open3d as o3d
+from scipy.spatial import cKDTree
+
+# Import Pi3 modules 
+from pi3.utils.basic import load_multimodal_data
+from pi3.utils.geometry import depth_edge
 from pi3.models.pi3x import Pi3X
 
-def apply_planar_projection(points_np, colors_np=None, radius=0.04, iterations=3):
-    """
-    Applies Moving Least Squares (MLS) Planar Projection to a point cloud array.
-    """
-    pcd = o3d.geometry.PointCloud()
-    
-    # Open3D works best with float64
-    pcd.points = o3d.utility.Vector3dVector(points_np.astype(np.float64))
-    if colors_np is not None:
-        pcd.colors = o3d.utility.Vector3dVector(colors_np.astype(np.float64))
+# Set up command-line argument parsing to receive paths from main.py
+parser = argparse.ArgumentParser(description="Pi3 Small Object Scanner - RunPod Serverless")
+parser.add_argument("--data_path", type=str, required=True, help="Path to the directory containing input images.")
+parser.add_argument("--save_path", type=str, required=True, help="Path where the final .ply mesh will be saved.")
+args = parser.parse_args()
 
-    num_points = len(points_np)
+# ==========================================
+# 2. PLANAR PROJECTION (THE "SURFACE IRON")
+# ==========================================
+def apply_planar_projection(points_np, colors_np=None, k_neighbors=30, iterations=2):
+    """
+    Vectorized MLS Smoothing. Acts as a surface iron to remove tiny 
+    high-frequency bumps (elevations) for perfect Poisson reconstruction.
+    """
+    points = np.copy(points_np.astype(np.float64))
     
     for it in range(iterations):
-        print(f"  -> Smoothing iteration {it + 1}/{iterations}...")
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamRadius(radius=radius))
+        print(f"  -> Ironing surface bumps: Iteration {it + 1}/{iterations}...")
         
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k_neighbors))
         normals = np.asarray(pcd.normals)
-        points = np.asarray(pcd.points)
-        new_points = np.copy(points)
-        pcd_tree = o3d.geometry.KDTreeFlann(pcd)
         
-        for i in range(num_points):
-            [k, idx, _] = pcd_tree.search_radius_vector_3d(pcd.points[i], radius)
-            if k > 3:
-                neighbors = points[idx, :]
-                centroid = np.mean(neighbors, axis=0)
-                normal = normals[i]
-                
-                vector_to_point = points[i] - centroid
-                distance_to_plane = np.dot(vector_to_point, normal)
-                new_points[i] = points[i] - (distance_to_plane * normal)
-                
-        pcd.points = o3d.utility.Vector3dVector(new_points)
-    
-    return np.asarray(pcd.points), np.asarray(pcd.colors) if colors_np is not None else None
-
-if __name__ == '__main__':
-    # --- Argument Parsing ---
-    parser = argparse.ArgumentParser(description="Run inference with the Pi3 model.")
-    
-    parser.add_argument("--data_path", type=str, default='examples/skating.mp4',
-                        help="Path to the input image directory or a video file.")
-    
-    # parser.add_argument("--conditions_path", type=str, default='examples/room/condition.npz',
-    parser.add_argument("--conditions_path", type=str, default=None,
-                        help="Optional path to a .npz file containing 'poses', 'depths', 'intrinsics'.")
-
-    parser.add_argument("--save_path", type=str, default='examples/result.ply',
-                        help="Path to save the output .ply file.")
-    parser.add_argument("--interval", type=int, default=-1,
-                        help="Interval to sample image. Default: 1 for images dir, 10 for video")
-    parser.add_argument("--ckpt", type=str, default=None,
-                        help="Path to the model checkpoint file. Default: None")
-    parser.add_argument("--device", type=str, default='cuda',
-                        help="Device to run inference on ('cuda' or 'cpu'). Default: 'cuda'")
-                        
-    args = parser.parse_args()
-    if args.interval < 0:
-        args.interval = 10 if args.data_path.endswith('.mp4') else 1
-    print(f'Sampling interval: {args.interval}')
-
-    # 1. Prepare input data
-    device = torch.device(args.device)
-
-    # Load optional conditions from .npz
-    poses = None
-    depths = None
-    intrinsics = None
-
-    if args.conditions_path is not None and os.path.exists(args.conditions_path):
-        print(f"Loading conditions from {args.conditions_path}...")
-        data_npz = np.load(args.conditions_path, allow_pickle=True)
-
-        poses = data_npz['poses']             # Expected (N, 4, 4) OpenCV camera-to-world
-        depths = data_npz['depths']           # Expected (N, H, W)
-        intrinsics = data_npz['intrinsics']   # Expected (N, 3, 3)
-
-    conditions = dict(
-        intrinsics=intrinsics,
-        poses=poses,
-        depths=depths
-    )
-
-    # Load images (Required)
-    imgs, conditions = load_multimodal_data(args.data_path, conditions, interval=args.interval, device=device) 
-    use_multimodal = any(v is not None for v in conditions.values())
-    if not use_multimodal:
-        print("No multimodal conditions found. Disable multimodal branch to reduce memory usage.")
-
-    # 2. Prepare model
-    print(f"Loading model...")
-    if args.ckpt is not None:
-        model = Pi3X(use_multimodal=use_multimodal).eval()
-        if args.ckpt.endswith('.safetensors'):
-            from safetensors.torch import load_file
-            weight = load_file(args.ckpt)
-        else:
-            weight = torch.load(args.ckpt, map_location=device, weights_only=False)
+        tree = cKDTree(points)
+        _, idx = tree.query(points, k=k_neighbors) 
         
-        model.load_state_dict(weight, strict=False)
+        neighbors = points[idx]
+        centroids = np.mean(neighbors, axis=1)
+        vector_to_point = points - centroids
+        
+        distance_to_plane = np.sum(vector_to_point * normals, axis=1)
+        points = points - (distance_to_plane[:, np.newaxis] * normals)
+        
+    return points, colors_np
+
+# ==========================================
+# 3. DIRECTORY PREPARATION
+# ==========================================
+data_path = args.data_path
+save_path = args.save_path
+
+print(f"\n[RunPod Process] Initializing compute job...")
+print(f"-> Reading input data from: {data_path}")
+print(f"-> Target output destination: {save_path}")
+
+# Ensure the output directory exists on the RunPod volume
+os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+if not os.path.exists(data_path):
+    raise ValueError(f"CRITICAL ERROR: The data path sent by the client does not exist: {data_path}")
+
+# ==========================================
+# 4. MAIN INFERENCE PIPELINE
+# ==========================================
+interval = 10 if data_path.endswith('.mp4') else 1
+conditions_path = None
+ckpt = None
+device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+print(f'\nUsing compute device: {device_name.upper()}')
+
+device = torch.device(device_name)
+conditions = dict(intrinsics=None, poses=None, depths=None)
+
+print("Loading multimodal data from volume...")
+imgs, conditions = load_multimodal_data(data_path, conditions, interval=interval, device=device) 
+use_multimodal = any(v is not None for v in conditions.values())
+if not use_multimodal:
+    print("No multimodal conditions found, running standard inference.")
+
+print("Loading Pi3X model into VRAM...")
+if ckpt is not None:
+    model = Pi3X(use_multimodal=use_multimodal).eval()
+    if ckpt.endswith('.safetensors'):
+        from safetensors.torch import load_file
+        weight = load_file(ckpt)
     else:
-        model = Pi3X.from_pretrained("yyfz233/Pi3X").eval()
-        # or download checkpoints from `https://huggingface.co/yyfz233/Pi3X/resolve/main/model.safetensors`, and `--ckpt ckpts/model.safetensors`
-        if not use_multimodal:
-            model.disable_multimodal()
-    model = model.to(device)
+        weight = torch.load(ckpt, map_location=device, weights_only=False)
+    model.load_state_dict(weight, strict=False)
+else:
+    model = Pi3X.from_pretrained("yyfz233/Pi3X").eval()
+    if not use_multimodal:
+        model.disable_multimodal()
 
-    # 3. Infer
-    print("Running model inference...")
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+model = model.to(device)
+
+print("Running deep learning inference...")
+dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+with torch.no_grad():
+    with torch.amp.autocast('cuda', dtype=dtype):
+        res = model(imgs=imgs, **conditions)
+
+masks = torch.sigmoid(res['conf'][..., 0]) > 0.1
+non_edge = ~depth_edge(res['local_points'][..., 2], rtol=0.03)
+masks = torch.logical_and(masks, non_edge)[0]
+
+# ==========================================
+# 5. ICP ALIGNMENT
+# ==========================================
+num_views = res['points'][0].shape[0]
+pcds = []
+
+print(f"\nExtracting {num_views} view-dependent point clouds...")
+for v in range(num_views):
+    view_mask = masks[v]
+    v_points = res['points'][0, v][view_mask].cpu().numpy()
+    v_colors = imgs[0, v].permute(1, 2, 0)[view_mask].cpu().numpy()
     
-    with torch.no_grad():
-        with torch.amp.autocast('cuda', dtype=dtype):
-            res = model(
-                imgs=imgs, 
-                **conditions
-            )
-
-    # 3.5 Recover intrinsic from rays_d
-    rays_d = torch.nn.functional.normalize(res['local_points'], dim=-1)
-    K = recover_intrinsic_from_rays_d(rays_d, force_center_principal_point=True)
-    print(f"Recovered first frame intrinsic: \n{K[0, 0].cpu().numpy()}")
-    if conditions['intrinsics'] is not None:
-        print(f"Original first frame intrinsic: \n{conditions['intrinsics'][0, 0].cpu().numpy()}")
-
-    # 4. process mask
-    masks = torch.sigmoid(res['conf'][..., 0]) > 0.1
-    non_edge = ~depth_edge(res['local_points'][..., 2], rtol=0.03)
-    masks = torch.logical_and(masks, non_edge)[0]
-
-    # 5. Extract, Smooth, and Save points
-    print("Extracting points for geometry refinement...")
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(v_points.astype(np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
     
-    # Extract raw masked points and colors to CPU numpy arrays
-    raw_points_np = res['points'][0][masks].cpu().numpy()
-    raw_colors_np = imgs[0].permute(0, 2, 3, 1)[masks].cpu().numpy()
+    pcd = pcd.voxel_down_sample(voxel_size=0.01)
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=30))
+    pcds.append(pcd)
 
-    # Apply the Planar Projection logic
-    print("Applying Planar Projection to collapse multi-view thickness...")
-    smoothed_points_np, smoothed_colors_np = apply_planar_projection(
-        points_np=raw_points_np, 
-        colors_np=raw_colors_np, 
-        radius=0.04, 
-        iterations=3
+print("Performing Point-to-Plane ICP Alignment...")
+target_pcd = pcds[0]
+aligned_pcds = [target_pcd]
+
+for v in range(1, num_views):
+    source_pcd = pcds[v]
+    reg_p2l = o3d.pipelines.registration.registration_icp(
+        source_pcd, target_pcd, 0.05, np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50)
     )
+    source_pcd.transform(reg_p2l.transformation)
+    aligned_pcds.append(source_pcd)
 
-    # Convert back to PyTorch tensors so the native write_ply function works normally
-    final_points_tensor = torch.from_numpy(smoothed_points_np).float()
-    final_colors_tensor = torch.from_numpy(smoothed_colors_np).float()
+final_pcd = o3d.geometry.PointCloud()
+for p in aligned_pcds:
+    final_pcd += p
 
-    print(f"Saving point cloud to: {args.save_path}")
-    if os.path.dirname(args.save_path):
-        os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        
-    # Use the pipeline's native writer with the newly smoothed tensors
-    write_ply(final_points_tensor, final_colors_tensor, args.save_path)
-    print("Done.")
+# ==========================================
+# 6. THE PERFECT CLEANUP PIPELINE
+# ==========================================
+print("\nFusing aligned mesh layers...")
+final_pcd = final_pcd.voxel_down_sample(voxel_size=0.015)
+
+print("Executing Statistical Outlier Removal to destroy ghosting...")
+final_pcd, _ = final_pcd.remove_statistical_outlier(nb_neighbors=25, std_ratio=1.5)
+
+clean_points = np.asarray(final_pcd.points)
+clean_colors = np.asarray(final_pcd.colors)
+
+print("Applying Surface Iron (Vectorized MLS) to smooth micro-elevations...")
+smoothed_points, smoothed_colors = apply_planar_projection(
+    clean_points, clean_colors, k_neighbors=30, iterations=2
+)
+
+final_pcd.points = o3d.utility.Vector3dVector(smoothed_points)
+final_pcd.colors = o3d.utility.Vector3dVector(smoothed_colors)
+
+print("Calculating and orienting pristine surface normals for Poisson...")
+final_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=40))
+final_pcd.orient_normals_consistent_tangent_plane(k=40)
+
+print(f"\nSaving final Point Cloud to volume for S3 retrieval: {save_path}")
+o3d.io.write_point_cloud(save_path, final_pcd, write_ascii=False)
+print("Serverless GPU Execution Complete. Mesh is ready for download.")
